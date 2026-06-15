@@ -897,10 +897,11 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
     from collections import defaultdict
 
     @st.cache_data(ttl=3600)
-    def _fetch_hist_for_recommendation(pair: str, inverse: bool = False):
+    def _fetch_hist_for_recommendation(pair: str, inverse: bool = False, period_days: int = 365):
         """
-        获取某货币对过去一年的历史收盘价。
+        获取某货币对指定天数的历史收盘价。
         inverse=True 时返回 1/rate（用于反方向推荐）。
+        period_days≥30 用日线，<30 用小时线。
         """
         symbol_map = {
             "USD/CNY": "CNY=X",
@@ -911,10 +912,11 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
         if not symbol:
             return []
         p2 = int(_time.time())
-        p1 = p2 - 365 * 24 * 3600
+        p1 = p2 - period_days * 24 * 3600
+        interval = "1d" if period_days >= 30 else "1h"
         url = (
             f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-            f"?period1={p1}&period2={p2}&interval=1d"
+            f"?period1={p1}&period2={p2}&interval={interval}"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
@@ -928,7 +930,7 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
         except Exception:
             return []
 
-    def _calc_stars(current_rate, hist_rates, higher_is_better: bool = False):
+    def _calc_stars(current_rate, hist_rates, higher_is_better: bool = False, period_label: str = "过去一年"):
         """
         根据当前汇率在历史数据中的百分位返回 (星级, 百分位, 理由, 标签)。
         higher_is_better=True  → 汇率越高越推荐（如美元换港元，越高换得越多）
@@ -970,9 +972,8 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
 
         direction_desc = "越高越划算" if higher_is_better else "越低越划算"
         reason = (
-            f"当前汇率处于过去一年 {percentile*100:.0f}% 分位"
-            f"（{direction_desc}，"
-            f"历史区间 {sorted_rates[0]:.6g} ~ {sorted_rates[-1]:.6g}）"
+            f"处于{period_label} {percentile*100:.0f}% 分位"
+            f"（{direction_desc}，区间 {sorted_rates[0]:.6g} ~ {sorted_rates[-1]:.6g}）"
         )
         return stars, percentile, reason, label
 
@@ -1020,24 +1021,40 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
         # 当前汇率（反方向时取倒数）
         current_rate = (1 / mid) if cfg["inverse"] else mid
 
-        hist = _fetch_hist_for_recommendation(pair_key, inverse=cfg["inverse"])
-        if not hist:
+        # 过去一年数据
+        hist_year = _fetch_hist_for_recommendation(pair_key, inverse=cfg["inverse"], period_days=365)
+        # 近一周数据
+        hist_week = _fetch_hist_for_recommendation(pair_key, inverse=cfg["inverse"], period_days=7)
+
+        if not hist_year and not hist_week:
             continue
 
-        hist_rates = [rate for _, rate in hist]
-        res = _calc_stars(current_rate, hist_rates, higher_is_better=cfg["higher_is_better"])
-        if res[0] is not None:
-            stars, percentile, reason, label = res
-            results[cfg["display_pair"]] = {
-                "stars": stars,
-                "percentile": percentile,
-                "reason": reason,
-                "label": label,
-                "current": current_rate,
-                "direction": cfg["direction"],
-                "hist_low": min(hist_rates),
-                "hist_high": max(hist_rates),
-            }
+        # 计算两个维度的星级
+        hb = cfg["higher_is_better"]
+        yr_result = None
+        wk_result = None
+
+        if hist_year:
+            yr_rates = [r for _, r in hist_year]
+            yr_result = _calc_stars(current_rate, yr_rates, higher_is_better=hb, period_label="过去一年")
+
+        if hist_week:
+            wk_rates = [r for _, r in hist_week]
+            wk_result = _calc_stars(current_rate, wk_rates, higher_is_better=hb, period_label="近一周")
+
+        if yr_result is None and wk_result is None:
+            continue
+
+        results[cfg["display_pair"]] = {
+            "current": current_rate,
+            "direction": cfg["direction"],
+            "year": yr_result if yr_result and yr_result[0] is not None else None,
+            "week": wk_result if wk_result and wk_result[0] is not None else None,
+            "yr_low": min(yr_rates) if hist_year else None,
+            "yr_high": max(yr_rates) if hist_year else None,
+            "wk_low": min(wk_rates) if hist_week else None,
+            "wk_high": max(wk_rates) if hist_week else None,
+        }
 
     if not results:
         st.info("暂无足够历史数据计算推荐指数")
@@ -1060,25 +1077,30 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
             padding: 16px 20px;
             margin-bottom: 12px;
         }
-        .rec-pair { font-size: 1rem; font-weight: 700; color: #1e293b; margin-bottom: 6px; }
-        .rec-stars { font-size: 1.5rem; margin-bottom: 4px; }
+        .rec-pair { font-size: 1rem; font-weight: 700; color: #1e293b; margin-bottom: 2px; }
+        .rec-dir { font-size: 0.72rem; color: #9ca3af; margin-bottom: 10px; }
+        .rec-row {
+            display: flex; align-items: center; gap: 10px;
+            margin-bottom: 6px; font-size: 0.85rem;
+        }
+        .rec-row .rec-period { width: 64px; font-size: 0.72rem; color: #6b7280; text-align: right; }
+        .rec-row .rec-star { font-size: 1.2rem; letter-spacing: 2px; }
         .rec-label {
             display: inline-block;
-            padding: 2px 10px;
+            padding: 1px 8px;
             border-radius: 20px;
-            font-size: 0.75rem;
+            font-size: 0.68rem;
             font-weight: 600;
-            margin-bottom: 6px;
         }
         .rec-label.star5 { background: #dcfce7; color: #166534; }
         .rec-label.star4 { background: #dbeafe; color: #1e40af; }
         .rec-label.star3 { background: #fef9c3; color: #854d0e; }
         .rec-label.star2 { background: #ffedd5; color: #9a3412; }
         .rec-label.star1 { background: #fee2e2; color: #991b1b; }
-        .rec-reason { font-size: 0.78rem; color: #6b7280; margin-top: 4px; }
+        .rec-reason { font-size: 0.68rem; color: #9ca3af; margin-left: 4px; }
         .rec-detail {
             display: flex; gap: 12px; flex-wrap: wrap;
-            margin-top: 8px; font-size: 0.72rem; color: #9ca3af;
+            margin-top: 10px; font-size: 0.72rem; color: #9ca3af;
         }
         .rec-detail span {
             background: white; padding: 2px 8px; border-radius: 4px;
@@ -1098,31 +1120,57 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
             if idx >= len(rec_items):
                 break
             pair, info = rec_items[idx]
-            stars = info["stars"]
-            star_str = "⭐" * stars + "☆" * (5 - stars)
-            label_class = f"star{stars}"
+
+            # 构建双行评级
+            ratings_html = ""
+            for period_key, label in [("year", "过去一年"), ("week", "近一周")]:
+                r = info.get(period_key)
+                if r is None:
+                    ratings_html += (
+                        f'<div class="rec-row">'
+                        f'<span class="rec-period">{label}</span>'
+                        f'<span class="rec-star" style="color:#d1d5db;">☆☆☆☆☆</span>'
+                        f'<span class="rec-label star1">数据不足</span>'
+                        f'</div>'
+                    )
+                else:
+                    stars, percentile, reason, tag = r
+                    star_str = "★" * stars + "☆" * (5 - stars)
+                    label_class = f"star{stars}"
+                    ratings_html += (
+                        f'<div class="rec-row">'
+                        f'<span class="rec-period">{label}</span>'
+                        f'<span class="rec-star">{star_str}</span>'
+                        f'<span class="rec-label {label_class}">{tag}</span>'
+                        f'<span class="rec-reason">{reason}</span>'
+                        f'</div>'
+                    )
+
+            # 构建详情行
+            detail_parts = [f'<span>当前 {info["current"]:.6g}</span>']
+            if info.get("yr_low") is not None:
+                detail_parts.append(f'<span>年内低 {info["yr_low"]:.6g}</span>')
+                detail_parts.append(f'<span>年内高 {info["yr_high"]:.6g}</span>')
+            if info.get("wk_low") is not None:
+                detail_parts.append(f'<span>周内低 {info["wk_low"]:.6g}</span>')
+                detail_parts.append(f'<span>周内高 {info["wk_high"]:.6g}</span>')
+
             with cols[j]:
                 st.markdown(
                     f'<div class="rec-card">'
                     f'<div class="rec-pair">{pair}</div>'
-                    f'<div style="font-size:0.72rem;color:#9ca3af;margin-bottom:6px;">{info["direction"]}</div>'
-                    f'<div class="rec-stars">{star_str}</div>'
-                    f'<div class="rec-label {label_class}">{info["label"]}</div>'
-                    f'<div class="rec-reason">{info["reason"]}</div>'
-                    f'<div class="rec-detail">'
-                    f'<span>当前 {info["current"]:.6g}</span>'
-                    f'<span>年内低 {info["hist_low"]:.6g}</span>'
-                    f'<span>年内高 {info["hist_high"]:.6g}</span>'
-                    f'</div>'
+                    f'<div class="rec-dir">{info["direction"]}</div>'
+                    f'{ratings_html}'
+                    f'<div class="rec-detail">{"".join(detail_parts)}</div>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
 
     st.caption(
-        "⭐ 推荐指数说明：基于过去一年 Yahoo Finance 历史汇率数据计算。"
-        "绿色方向（人民币换美元、港元换美元）：汇率越低越划算，越低分位星级越高；"
-        "蓝色方向（人民币换美元反向、美元换港元）：汇率越高越划算，越高分位星级越高。"
-        "仅供参考，不构成投资建议。"
+        "★ 推荐指数说明：过去一年基于日线数据，近一周基于小时线数据。"
+        "绿色方向（人民币买美元、港元买美元）：汇率越低越划算；"
+        "蓝色方向（人民币换港元、美元换港元）：汇率越高越划算。"
+        "数据来源：Yahoo Finance，仅供参考，不构成投资建议。"
     )
 
 
