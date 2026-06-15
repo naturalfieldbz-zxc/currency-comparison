@@ -897,9 +897,11 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
     from collections import defaultdict
 
     @st.cache_data(ttl=3600)
-    def _fetch_hist_for_recommendation(pair: str):
-        """获取某货币对过去一年的历史收盘价，返回 (timestamps, closes) 列表"""
-        # 货币对 -> Yahoo Finance symbol
+    def _fetch_hist_for_recommendation(pair: str, inverse: bool = False):
+        """
+        获取某货币对过去一年的历史收盘价。
+        inverse=True 时返回 1/rate（用于反方向推荐）。
+        """
         symbol_map = {
             "USD/CNY": "CNY=X",
             "USD/HKD": "HKD=X",
@@ -920,60 +922,118 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
             result = data["chart"]["result"][0]
             timestamps = result["timestamp"]
             closes = result["indicators"]["quote"][0]["close"]
-            return [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
+            pairs = [(ts, (1 / c if inverse else c)) for ts, c in zip(timestamps, closes) if c is not None]
+            return pairs
         except Exception:
             return []
 
-    def _calc_stars(current_rate, hist_rates):
-        """根据当前汇率在历史数据中的百分位返回 (星级, 百分位, 理由)"""
+    def _calc_stars(current_rate, hist_rates, higher_is_better: bool = False):
+        """
+        根据当前汇率在历史数据中的百分位返回 (星级, 百分位, 理由, 标签)。
+        higher_is_better=True  → 汇率越高越推荐（如美元换港元，越高换得越多）
+        higher_is_better=False → 汇率越低越推荐（如人民币换美元，越低越便宜）
+        """
         if not hist_rates or current_rate is None:
-            return None, None, "数据不足"
+            return None, None, "数据不足", ""
         sorted_rates = sorted(hist_rates)
         n = len(sorted_rates)
-        # 找到当前汇率在历史中的排名（从小到大）
-        rank = sum(1 for r in sorted_rates if r <= current_rate)
-        percentile = rank / n  # 0=历史最低, 1=历史最高
-        # 对于购汇（用基准货币买报价货币），汇率越低越划算
-        # 所以 percentile 越低越推荐
-        if percentile <= 0.15:
-            stars, label = 5, "非常推荐"
-        elif percentile <= 0.35:
-            stars, label = 4, "比较推荐"
-        elif percentile <= 0.55:
-            stars, label = 3, "可以购汇"
-        elif percentile <= 0.75:
-            stars, label = 2, "不太划算"
+
+        if higher_is_better:
+            # 越高越推荐：百分位越高星级越高
+            rank = sum(1 for r in sorted_rates if r <= current_rate)
+            percentile = rank / n  # 高 = 接近历史高点 = 好
+            if percentile >= 0.85:
+                stars, label = 5, "非常推荐"
+            elif percentile >= 0.65:
+                stars, label = 4, "比较推荐"
+            elif percentile >= 0.45:
+                stars, label = 3, "可以购汇"
+            elif percentile >= 0.25:
+                stars, label = 2, "不太划算"
+            else:
+                stars, label = 1, "暂不推荐"
         else:
-            stars, label = 1, "暂不推荐"
+            # 越低越推荐：百分位越低星级越高
+            rank = sum(1 for r in sorted_rates if r <= current_rate)
+            percentile = rank / n
+            if percentile <= 0.15:
+                stars, label = 5, "非常推荐"
+            elif percentile <= 0.35:
+                stars, label = 4, "比较推荐"
+            elif percentile <= 0.55:
+                stars, label = 3, "可以购汇"
+            elif percentile <= 0.75:
+                stars, label = 2, "不太划算"
+            else:
+                stars, label = 1, "暂不推荐"
+
+        direction_desc = "越高越划算" if higher_is_better else "越低越划算"
         reason = (
             f"当前汇率处于过去一年 {percentile*100:.0f}% 分位"
-            f"（{'较低' if percentile <= 0.5 else '较高'}，"
-            f"历史区间 {sorted_rates[0]:.4f} ~ {sorted_rates[-1]:.4f}）"
+            f"（{direction_desc}，"
+            f"历史区间 {sorted_rates[0]:.6g} ~ {sorted_rates[-1]:.6g}）"
         )
         return stars, percentile, reason, label
 
-    # 只对真实数据可用的货币对计算推荐指数
-    target_pairs = ["USD/CNY", "USD/HKD"]
-    tz = datetime.now().astimezone().tzinfo
+    # 推荐指数配置：同一 Yahoo 数据源可以同时服务正反两个方向
+    # higher_is_better: True  → 汇率越高越推荐（如美元换港元，换得越多越好）
+    # higher_is_better: False → 汇率越低越推荐（如人民币换美元，越低越便宜）
+    rec_configs = [
+        {
+            "yahoo_pair": "USD/CNY",
+            "display_pair": "USD/CNY",
+            "direction": "用人民币买美元",
+            "inverse": False,
+            "higher_is_better": False,
+        },
+        {
+            "yahoo_pair": "USD/HKD",
+            "display_pair": "USD/HKD",
+            "direction": "用港元买美元",
+            "inverse": False,
+            "higher_is_better": False,
+        },
+        {
+            "yahoo_pair": "USD/CNY",
+            "display_pair": "CNY/USD",
+            "direction": "人民币换美元",
+            "inverse": True,   # 用 1/rate 作为历史数据
+            "higher_is_better": True,
+        },
+        {
+            "yahoo_pair": "USD/HKD",
+            "display_pair": "HKD/USD",
+            "direction": "美元换港元",
+            "inverse": False,
+            "higher_is_better": True,
+        },
+    ]
 
     results = {}
-    for pair in target_pairs:
-        mid = snapshot.base_mid_rates.get(pair)
+    for cfg in rec_configs:
+        pair_key = cfg["yahoo_pair"]
+        mid = snapshot.base_mid_rates.get(pair_key)
         if mid is None:
             continue
-        hist = _fetch_hist_for_recommendation(pair)
+
+        # 当前汇率（反方向时取倒数）
+        current_rate = (1 / mid) if cfg["inverse"] else mid
+
+        hist = _fetch_hist_for_recommendation(pair_key, inverse=cfg["inverse"])
         if not hist:
             continue
+
         hist_rates = [rate for _, rate in hist]
-        res = _calc_stars(mid, hist_rates)
+        res = _calc_stars(current_rate, hist_rates, higher_is_better=cfg["higher_is_better"])
         if res[0] is not None:
             stars, percentile, reason, label = res
-            results[pair] = {
+            results[cfg["display_pair"]] = {
                 "stars": stars,
                 "percentile": percentile,
                 "reason": reason,
                 "label": label,
-                "current": mid,
+                "current": current_rate,
+                "direction": cfg["direction"],
                 "hist_low": min(hist_rates),
                 "hist_high": max(hist_rates),
             }
@@ -1028,38 +1088,40 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
         unsafe_allow_html=True,
     )
 
-    cols = st.columns(len(results))
-    for i, (pair, info) in enumerate(results.items()):
-        stars = info["stars"]
-        star_str = "⭐" * stars + "☆" * (5 - stars)
-        label_class = f"star{stars}"
-        pair_label_map = {
-            "USD/CNY": "用人民币买美元",
-            "USD/HKD": "用港元买美元",
-        }
-        direction = pair_label_map.get(pair, f"购汇 {pair}")
-
-        with cols[i]:
-            st.markdown(
-                f'<div class="rec-card">'
-                f'<div class="rec-pair">{pair}</div>'
-                f'<div style="font-size:0.72rem;color:#9ca3af;margin-bottom:6px;">{direction}</div>'
-                f'<div class="rec-stars">{star_str}</div>'
-                f'<div class="rec-label {label_class}">{info["label"]}</div>'
-                f'<div class="rec-reason">{info["reason"]}</div>'
-                f'<div class="rec-detail">'
-                f'<span>当前 {info["current"]:.4f}</span>'
-                f'<span>年内低 {info["hist_low"]:.4f}</span>'
-                f'<span>年内高 {info["hist_high"]:.4f}</span>'
-                f'</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+    # 2×2 排列，每行 2 张卡片
+    rec_items = list(results.items())
+    for row_start in range(0, len(rec_items), 2):
+        cols = st.columns(2)
+        for j in range(2):
+            idx = row_start + j
+            if idx >= len(rec_items):
+                break
+            pair, info = rec_items[idx]
+            stars = info["stars"]
+            star_str = "⭐" * stars + "☆" * (5 - stars)
+            label_class = f"star{stars}"
+            with cols[j]:
+                st.markdown(
+                    f'<div class="rec-card">'
+                    f'<div class="rec-pair">{pair}</div>'
+                    f'<div style="font-size:0.72rem;color:#9ca3af;margin-bottom:6px;">{info["direction"]}</div>'
+                    f'<div class="rec-stars">{star_str}</div>'
+                    f'<div class="rec-label {label_class}">{info["label"]}</div>'
+                    f'<div class="rec-reason">{info["reason"]}</div>'
+                    f'<div class="rec-detail">'
+                    f'<span>当前 {info["current"]:.6g}</span>'
+                    f'<span>年内低 {info["hist_low"]:.6g}</span>'
+                    f'<span>年内高 {info["hist_high"]:.6g}</span>'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     st.caption(
-        "⭐ 推荐指数说明：基于过去一年历史汇率数据，"
-        "当前汇率越接近历史低点星级越高（越低越划算）。"
-        "数据来源：Yahoo Finance，仅供参考，不构成投资建议。"
+        "⭐ 推荐指数说明：基于过去一年 Yahoo Finance 历史汇率数据计算。"
+        "绿色方向（人民币换美元、港元换美元）：汇率越低越划算，越低分位星级越高；"
+        "蓝色方向（人民币换美元反向、美元换港元）：汇率越高越划算，越高分位星级越高。"
+        "仅供参考，不构成投资建议。"
     )
 
 
