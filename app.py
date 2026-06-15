@@ -778,6 +778,233 @@ def render_line_chart(snapshot: RateSnapshot):
     )
 
 
+@st.cache_data(ttl=86400)  # 缓存一天
+def _fetch_historical_analysis():
+    """从 Yahoo Finance 拉取近一年日线数据并分析最佳购汇时段"""
+    import urllib.request
+    import json as _json
+    import time as _time
+    from collections import defaultdict
+
+    tz = datetime.now().astimezone().tzinfo
+
+    def _get_yahoo(symbol, period1, period2, interval="1d"):
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            f"?period1={period1}&period2={period2}&interval={interval}"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = _json.loads(resp.read())
+            result = data["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            closes = result["indicators"]["quote"][0]["close"]
+            return [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
+        except Exception:
+            return []
+
+    p2 = int(_time.time())
+    p1 = p2 - 365 * 24 * 3600
+    day_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+    results = {}
+    for symbol, label, quote in [
+        ("CNY=X", "USD/CNY", "CNY"),
+        ("HKD=X", "USD/HKD", "HKD"),
+    ]:
+        data = _get_yahoo(symbol, p1, p2)
+        if not data:
+            continue
+
+        # 按星期统计
+        dow_map = defaultdict(list)
+        for ts, rate in data:
+            dt = datetime.fromtimestamp(ts, tz=tz)
+            if dt.weekday() < 5:  # 仅工作日
+                dow_map[dt.weekday()].append(rate)
+
+        dow_stats = []
+        for dow, rates in dow_map.items():
+            dow_stats.append({
+                "day": day_names[dow],
+                "dow": dow,
+                "avg": round(sum(rates) / len(rates), 4),
+                "count": len(rates),
+            })
+        dow_stats.sort(key=lambda x: x["avg"])
+
+        # 按月统计
+        mon_map = defaultdict(list)
+        for ts, rate in data:
+            dt = datetime.fromtimestamp(ts, tz=tz)
+            mon_map[dt.month].append(rate)
+        mon_stats = []
+        for m, rates in mon_map.items():
+            mon_stats.append({
+                "month": m,
+                "avg": round(sum(rates) / len(rates), 4),
+                "count": len(rates),
+            })
+        mon_stats.sort(key=lambda x: x["avg"])
+
+        # 日内小时级（近7天）
+        hp1 = p2 - 7 * 24 * 3600
+        hourly_data = _get_yahoo(symbol, hp1, p2, "1h")
+        hour_map = defaultdict(list)
+        for ts, rate in hourly_data:
+            dt = datetime.fromtimestamp(ts, tz=tz)
+            if dt.weekday() < 5:
+                hour_map[dt.hour].append(rate)
+        hour_stats = []
+        am_list, pm_list = [], []
+        for h, rates in sorted(hour_map.items()):
+            avg = round(sum(rates) / len(rates), 4)
+            hour_stats.append({"hour": h, "avg": avg, "count": len(rates)})
+            if h < 12:
+                am_list.extend(rates)
+            else:
+                pm_list.extend(rates)
+        hour_stats.sort(key=lambda x: x["avg"])
+
+        am_avg = round(sum(am_list) / len(am_list), 4) if am_list else None
+        pm_avg = round(sum(pm_list) / len(pm_list), 4) if pm_list else None
+        better = "下午" if am_avg and pm_avg and pm_avg < am_avg else "上午"
+
+        results[label] = {
+            "dow": dow_stats,
+            "monthly": mon_stats[:6],
+            "hourly": hour_stats,
+            "am_avg": am_avg,
+            "pm_avg": pm_avg,
+            "better_half": better,
+            "best_dow": dow_stats[0]["day"] if dow_stats else None,
+            "best_month": mon_stats[0]["month"] if mon_stats else None,
+        }
+
+    return results
+
+
+def render_best_time_card():
+    """渲染最佳购汇时机分析卡片"""
+    with st.spinner("正在分析历史汇率数据..."):
+        analysis = _fetch_historical_analysis()
+
+    if not analysis:
+        st.warning("无法获取历史数据进行分析")
+        return
+
+    st.markdown("""
+    <style>
+    .time-card { background: linear-gradient(135deg, #f0f9ff 0%, #ecfdf5 100%);
+        border-radius: 12px; padding: 20px; margin: 16px 0; border: 1px solid #d1d5db; }
+    .time-card h4 { margin: 0 0 12px 0; color: #1f2937; font-size: 1.05rem; }
+    .time-row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .time-col { flex: 1; min-width: 220px; background: white; border-radius: 8px;
+        padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .time-label { font-size: 0.75rem; color: #6b7280; margin-bottom: 4px; }
+    .time-value { font-size: 1.1rem; font-weight: 700; color: #059669; }
+    .time-value.warn { color: #dc2626; }
+    .time-sub { font-size: 0.7rem; color: #9ca3af; margin-top: 2px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="section-header">⏰ 最佳购汇时机分析（基于近一年真实市场数据）</div>',
+        unsafe_allow_html=True,
+    )
+
+    for pair_label, info in analysis.items():
+        base, quote = pair_label.split("/")
+
+        # ---- 卡片标题 ----
+        st.markdown(f"#### {pair_label}（购{base}，花{quote}）")
+
+        # ---- 三个维度卡片横排 ----
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.markdown('<div class="time-card">', unsafe_allow_html=True)
+            st.markdown(f"<h4>📅 最佳星期</h4>", unsafe_allow_html=True)
+            if info["dow"]:
+                best = info["dow"][0]
+                worst = info["dow"][-1]
+                spread = round((worst["avg"] - best["avg"]) * 10000, 1)
+                st.markdown(
+                    f'<div class="time-label">最划算</div>'
+                    f'<div class="time-value">{best["day"]}（均价 {best["avg"]:.4f}）</div>'
+                    f'<div class="time-sub">比最差的{worst["day"]}省 {spread} bps</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # 微型条形图：各天排名
+                rows = []
+                for i, d in enumerate(info["dow"]):
+                    color = "#059669" if i == 0 else ("#dc2626" if i == len(info["dow"]) - 1 else "#9ca3af")
+                    bar_w = max(8, int(100 - (d["avg"] - info["dow"][0]["avg"]) * 800))
+                    rows.append(
+                        f'<div style="display:flex;align-items:center;margin:4px 0;font-size:0.7rem;">'
+                        f'<span style="width:36px;text-align:right;margin-right:6px;color:{color};">'
+                        f'{d["day"]}</span>'
+                        f'<span style="flex:1;height:10px;background:#e5e7eb;border-radius:5px;overflow:hidden;">'
+                        f'<span style="display:block;width:{bar_w}%;height:100%;background:{color};'
+                        f'border-radius:5px;"></span></span>'
+                        f'<span style="width:52px;text-align:right;margin-left:6px;color:{color};">'
+                        f'{d["avg"]:.4f}</span></div>'
+                    )
+                st.markdown("".join(rows), unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with c2:
+            st.markdown('<div class="time-card">', unsafe_allow_html=True)
+            st.markdown(f"<h4>🕐 最佳时段</h4>", unsafe_allow_html=True)
+            if info["hourly"]:
+                best_h = info["hourly"][0]
+                am = info.get("am_avg")
+                pm = info.get("pm_avg")
+                st.markdown(
+                    f'<div class="time-label">日内最优点</div>'
+                    f'<div class="time-value">{best_h["hour"]:02d}:00 左右</div>',
+                    unsafe_allow_html=True,
+                )
+                if am and pm:
+                    diff = abs(am - pm)
+                    st.markdown(
+                        f'<div class="time-label" style="margin-top:8px;">上 / 下午对比</div>'
+                        f'<div style="font-size:0.8rem;margin-top:2px;">'
+                        f'上午均价 {am:.4f} &nbsp;|&nbsp; 下午均价 {pm:.4f}</div>'
+                        f'<div class="time-value" style="font-size:0.9rem;">'
+                        f'{info["better_half"]}更优'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with c3:
+            st.markdown('<div class="time-card">', unsafe_allow_html=True)
+            st.markdown(f"<h4>📆 最佳月份</h4>", unsafe_allow_html=True)
+            if info["monthly"]:
+                best_m = info["monthly"][0]
+                st.markdown(
+                    f'<div class="time-value">{best_m["month"]}月（均价 {best_m["avg"]:.4f}）</div>',
+                    unsafe_allow_html=True,
+                )
+                # 列出前3
+                top3 = info["monthly"][:3]
+                for i, m in enumerate(top3):
+                    icon = "🥇" if i == 0 else ("🥈" if i == 1 else "🥉")
+                    st.markdown(
+                        f'<div style="font-size:0.75rem;margin:2px 0;">'
+                        f'{icon} {m["month"]}月：{m["avg"]:.4f}</div>',
+                        unsafe_allow_html=True,
+                    )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    st.caption("💡 数据来源：Yahoo Finance 近一年日线 + 近7天小时级数据。汇率越低 = 花更少人民币/港元买外币。历史规律仅供参考，不构成投资建议。")
+
+
 def render_data_source_info(snapshot: RateSnapshot):
     """渲染数据来源说明"""
     with st.expander("数据来源说明", expanded=False):
@@ -889,6 +1116,10 @@ def main():
 
             # 图表
             render_chart(snapshot.rates, pair, snapshot)
+
+    # 最佳购汇时机分析
+    st.divider()
+    render_best_time_card()
 
     # 数据来源说明
     st.divider()
