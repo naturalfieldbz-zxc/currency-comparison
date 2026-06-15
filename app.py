@@ -905,6 +905,7 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
         symbol_map = {
             "USD/CNY": "CNY=X",
             "USD/HKD": "HKD=X",
+            "CNY/HKD": "CNYHKD=X",
         }
         symbol = symbol_map.get(pair)
         if not symbol:
@@ -992,6 +993,13 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
             "direction": "用港元买美元",
             "inverse": False,
             "higher_is_better": False,
+        },
+        {
+            "yahoo_pair": "CNY/HKD",
+            "display_pair": "CNY/HKD",
+            "direction": "人民币换港元",
+            "inverse": False,
+            "higher_is_better": True,
         },
         {
             "yahoo_pair": "USD/CNY",
