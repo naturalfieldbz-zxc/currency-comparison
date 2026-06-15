@@ -885,6 +885,184 @@ def _fetch_historical_analysis():
     return results
 
 
+def render_purchase_recommendation(snapshot: RateSnapshot):
+    """
+    渲染购汇推荐指数卡片（1-5星）
+    逻辑：拉取过去一年历史汇率，计算当前汇率在历史中的百分位，
+         百分位越低（越接近历史低点）星级越高。
+    """
+    import urllib.request
+    import json as _json
+    import time as _time
+    from collections import defaultdict
+
+    @st.cache_data(ttl=3600)
+    def _fetch_hist_for_recommendation(pair: str):
+        """获取某货币对过去一年的历史收盘价，返回 (timestamps, closes) 列表"""
+        # 货币对 -> Yahoo Finance symbol
+        symbol_map = {
+            "USD/CNY": "CNY=X",
+            "USD/HKD": "HKD=X",
+        }
+        symbol = symbol_map.get(pair)
+        if not symbol:
+            return []
+        p2 = int(_time.time())
+        p1 = p2 - 365 * 24 * 3600
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            f"?period1={p1}&period2={p2}&interval=1d"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = _json.loads(resp.read())
+            result = data["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            closes = result["indicators"]["quote"][0]["close"]
+            return [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
+        except Exception:
+            return []
+
+    def _calc_stars(current_rate, hist_rates):
+        """根据当前汇率在历史数据中的百分位返回 (星级, 百分位, 理由)"""
+        if not hist_rates or current_rate is None:
+            return None, None, "数据不足"
+        sorted_rates = sorted(hist_rates)
+        n = len(sorted_rates)
+        # 找到当前汇率在历史中的排名（从小到大）
+        rank = sum(1 for r in sorted_rates if r <= current_rate)
+        percentile = rank / n  # 0=历史最低, 1=历史最高
+        # 对于购汇（用基准货币买报价货币），汇率越低越划算
+        # 所以 percentile 越低越推荐
+        if percentile <= 0.15:
+            stars, label = 5, "非常推荐"
+        elif percentile <= 0.35:
+            stars, label = 4, "比较推荐"
+        elif percentile <= 0.55:
+            stars, label = 3, "可以购汇"
+        elif percentile <= 0.75:
+            stars, label = 2, "不太划算"
+        else:
+            stars, label = 1, "暂不推荐"
+        reason = (
+            f"当前汇率处于过去一年 {percentile*100:.0f}% 分位"
+            f"（{'较低' if percentile <= 0.5 else '较高'}，"
+            f"历史区间 {sorted_rates[0]:.4f} ~ {sorted_rates[-1]:.4f}）"
+        )
+        return stars, percentile, reason, label
+
+    # 只对真实数据可用的货币对计算推荐指数
+    target_pairs = ["USD/CNY", "USD/HKD"]
+    tz = datetime.now().astimezone().tzinfo
+
+    results = {}
+    for pair in target_pairs:
+        mid = snapshot.base_mid_rates.get(pair)
+        if mid is None:
+            continue
+        hist = _fetch_hist_for_recommendation(pair)
+        if not hist:
+            continue
+        hist_rates = [rate for _, rate in hist]
+        res = _calc_stars(mid, hist_rates)
+        if res[0] is not None:
+            stars, percentile, reason, label = res
+            results[pair] = {
+                "stars": stars,
+                "percentile": percentile,
+                "reason": reason,
+                "label": label,
+                "current": mid,
+                "hist_low": min(hist_rates),
+                "hist_high": max(hist_rates),
+            }
+
+    if not results:
+        st.info("暂无足够历史数据计算推荐指数")
+        return
+
+    # ---- 渲染 UI ----
+    st.markdown(
+        '<div class="section-header">⭐ 购汇推荐指数</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 星级显示的 CSS
+    st.markdown(
+        """
+        <style>
+        .rec-card {
+            background: linear-gradient(135deg, #fefce8 0%, #f0fdf4 100%);
+            border: 1px solid #bbf7d0;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 12px;
+        }
+        .rec-pair { font-size: 1rem; font-weight: 700; color: #1e293b; margin-bottom: 6px; }
+        .rec-stars { font-size: 1.5rem; margin-bottom: 4px; }
+        .rec-label {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        .rec-label.star5 { background: #dcfce7; color: #166534; }
+        .rec-label.star4 { background: #dbeafe; color: #1e40af; }
+        .rec-label.star3 { background: #fef9c3; color: #854d0e; }
+        .rec-label.star2 { background: #ffedd5; color: #9a3412; }
+        .rec-label.star1 { background: #fee2e2; color: #991b1b; }
+        .rec-reason { font-size: 0.78rem; color: #6b7280; margin-top: 4px; }
+        .rec-detail {
+            display: flex; gap: 12px; flex-wrap: wrap;
+            margin-top: 8px; font-size: 0.72rem; color: #9ca3af;
+        }
+        .rec-detail span {
+            background: white; padding: 2px 8px; border-radius: 4px;
+            border: 1px solid #e5e7eb;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns(len(results))
+    for i, (pair, info) in enumerate(results.items()):
+        stars = info["stars"]
+        star_str = "⭐" * stars + "☆" * (5 - stars)
+        label_class = f"star{stars}"
+        pair_label_map = {
+            "USD/CNY": "用人民币买美元",
+            "USD/HKD": "用港元买美元",
+        }
+        direction = pair_label_map.get(pair, f"购汇 {pair}")
+
+        with cols[i]:
+            st.markdown(
+                f'<div class="rec-card">'
+                f'<div class="rec-pair">{pair}</div>'
+                f'<div style="font-size:0.72rem;color:#9ca3af;margin-bottom:6px;">{direction}</div>'
+                f'<div class="rec-stars">{star_str}</div>'
+                f'<div class="rec-label {label_class}">{info["label"]}</div>'
+                f'<div class="rec-reason">{info["reason"]}</div>'
+                f'<div class="rec-detail">'
+                f'<span>当前 {info["current"]:.4f}</span>'
+                f'<span>年内低 {info["hist_low"]:.4f}</span>'
+                f'<span>年内高 {info["hist_high"]:.4f}</span>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    st.caption(
+        "⭐ 推荐指数说明：基于过去一年历史汇率数据，"
+        "当前汇率越接近历史低点星级越高（越低越划算）。"
+        "数据来源：Yahoo Finance，仅供参考，不构成投资建议。"
+    )
+
+
 def render_best_time_card():
     """渲染最佳购汇时机分析卡片"""
     with st.spinner("正在分析历史汇率数据..."):
@@ -1116,6 +1294,10 @@ def main():
 
             # 图表
             render_chart(snapshot.rates, pair, snapshot)
+
+    # 购汇推荐指数
+    st.divider()
+    render_purchase_recommendation(snapshot)
 
     # 最佳购汇时机分析
     st.divider()
