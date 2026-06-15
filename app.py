@@ -3,8 +3,9 @@
 支持: CNY, HKD, USD 之间的兑换汇率对比
 """
 
+import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import altair as alt
 import pandas as pd
@@ -609,6 +610,174 @@ def render_ranking(snapshot: RateSnapshot):
         )
 
 
+def render_line_chart(snapshot: RateSnapshot):
+    """渲染实时汇率折线图，支持切换时/日/周/月/年"""
+
+    pairs = ["USD/CNY", "USD/HKD", "HKD/CNY", "CNY/HKD", "HKD/USD"]
+    pair_labels = {
+        "USD/CNY": "美元 / 人民币",
+        "USD/HKD": "美元 / 港元",
+        "HKD/CNY": "港元 / 人民币",
+        "CNY/HKD": "人民币 / 港元",
+        "HKD/USD": "港元 / 美元",
+    }
+
+    # ---- 控制行：左侧选货币对，右侧切时间范围 ----
+    ctl1, ctl2, ctl3 = st.columns([2, 5, 2])
+    with ctl1:
+        selected_pair = st.selectbox(
+            "货币对",
+            pairs,
+            format_func=lambda p: pair_labels.get(p, p),
+            key="line_pair",
+        )
+    with ctl2:
+        time_opts = ["1小时", "1天", "1周", "1月", "1年"]
+        selected_range = st.radio(
+            "时间范围",
+            time_opts,
+            horizontal=True,
+            index=1,
+            key="line_range",
+        )
+
+    # ---- 生成模拟历史数据 ----
+    range_minutes = {"1小时": 60, "1天": 1440, "1周": 10080, "1月": 43200, "1年": 525600}
+    lookback = range_minutes[selected_range]
+
+    interval = min(max(lookback // 24, 1), 1440)
+    num_pts = max(lookback // interval, 12)
+
+    vol_map = {
+        "USD/CNY": 0.00015, "USD/HKD": 0.00002,
+        "HKD/CNY": 0.00010, "CNY/HKD": 0.00010, "HKD/USD": 0.00002,
+    }
+    vol = vol_map.get(selected_pair, 0.00010)
+
+    current_rates = [r for r in snapshot.rates if r.pair == selected_pair]
+
+    random.seed(42)  # 保证同一页刷新时图表稳定
+    now = datetime.now()
+    chart_rows = []
+
+    for r in current_rates:
+        steps = [random.gauss(0, vol) for _ in range(num_pts - 1)]
+        cumsum = [0.0]
+        for s in steps:
+            cumsum.append(cumsum[-1] + s)
+
+        offset_buy = r.buy_rate - cumsum[-1]
+        offset_sell = r.sell_rate - cumsum[-1]
+
+        for i in range(num_pts):
+            t = now - timedelta(minutes=interval * (num_pts - 1 - i))
+            chart_rows.append({
+                "时间": t,
+                "机构": r.institution,
+                "类别": "银行" if r.category == BANK_CATEGORY else "券商",
+                "买入价": round(offset_buy + cumsum[i], 6),
+                "卖出价": round(offset_sell + cumsum[i], 6),
+            })
+
+    df = pd.DataFrame(chart_rows)
+
+    # ---- 机构筛选 ----
+    institutions = sorted(df["机构"].unique().tolist())
+    # 把中行排第一，盈透排第二，其余按字母
+    priority = ["中国银行", "盈透证券"]
+    ordered = [i for i in priority if i in institutions]
+    ordered += sorted([i for i in institutions if i not in priority])
+
+    with ctl3:
+        show_all = st.checkbox("显示全部", value=False, key="line_show_all")
+    if not show_all:
+        default_insts = ["中国银行"] if "中国银行" in ordered else ordered[:1]
+        selected_insts = st.multiselect(
+            "选择机构", ordered, default=default_insts, key="line_insts"
+        )
+    else:
+        selected_insts = ordered
+
+    df = df[df["机构"].isin(selected_insts)]
+
+    # ---- 买入价 / 卖出价 切换 ----
+    rate_type = st.radio(
+        "查看价格",
+        ["买入价 (你卖出基准货币)", "卖出价 (你买入基准货币)"],
+        horizontal=True,
+        index=0,
+        key="line_rate_type",
+    )
+    y_field = "买入价" if "买入价" in rate_type else "卖出价"
+    base, quote = selected_pair.split("/")
+
+    # ---- 颜色映射 ----
+    color_palette = [
+        "#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6",
+        "#ec4899", "#06b6d4", "#84cc16", "#f97316",
+    ]
+    inst_colors = {inst: color_palette[i % len(color_palette)] for i, inst in enumerate(ordered)}
+
+    # ---- Altair 折线图 ----
+    nearest = alt.selection_single(
+        nearest=True, on="mouseover", fields=["时间"], empty="none"
+    )
+
+    line = (
+        alt.Chart(df)
+        .mark_line(point=alt.OverlayMarkDef(size=40, filled=True))
+        .encode(
+            x=alt.X("时间:T", title=None, axis=alt.Axis(grid=True, gridColor="#f3f4f6")),
+            y=alt.Y(
+                f"{y_field}:Q",
+                title=f"汇率 (1 {base} = X {quote})",
+                scale=alt.Scale(zero=False),
+                axis=alt.Axis(grid=True, gridColor="#f3f4f6"),
+            ),
+            color=alt.Color(
+                "机构:N",
+                title=None,
+                scale=alt.Scale(domain=list(inst_colors.keys()), range=list(inst_colors.values())),
+                legend=alt.Legend(orient="bottom", columns=5, labelFontSize=12),
+            ),
+            tooltip=[
+                alt.Tooltip("时间:T", title="时间", format="%m-%d %H:%M"),
+                alt.Tooltip("机构:N", title="机构"),
+                alt.Tooltip(f"{y_field}:Q", title=y_field, format=".4f"),
+            ],
+        )
+    )
+
+    # 悬停十字线
+    selectors = (
+        alt.Chart(df)
+        .mark_rule(color="#d1d5db", strokeDash=[3, 3])
+        .encode(x="时间:T")
+        .add_params(nearest)
+    )
+
+    points = line.mark_point().encode(opacity=alt.condition(nearest, alt.value(1), alt.value(0)))
+
+    text = (
+        line.mark_text(align="left", dx=5, dy=-10, fontSize=11)
+        .encode(text=alt.condition(nearest, f"{y_field}:Q", alt.value(" "), format=".4f"))
+    )
+
+    chart = alt.layer(line, selectors, points, text).properties(
+        height=380,
+    ).configure_view(
+        stroke=None,
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
+    # ---- 图例说明 ----
+    st.caption(
+        "数据为模拟历史走势，基于当前汇率 + 随机游走生成，仅展示趋势形态，"
+        "不代表真实历史数据。每次刷新数据会重新生成。"
+    )
+
+
 def render_data_source_info(snapshot: RateSnapshot):
     """渲染数据来源说明"""
     with st.expander("数据来源说明", expanded=False):
@@ -676,6 +845,12 @@ def main():
     # TOP 5 排行榜
     with st.expander("🏆 实时排行榜 TOP 5", expanded=True):
         render_ranking(snapshot)
+
+    st.divider()
+
+    # 实时折线图
+    with st.expander("📈 实时价格走势", expanded=True):
+        render_line_chart(snapshot)
 
     st.divider()
 
