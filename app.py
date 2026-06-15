@@ -1002,13 +1002,6 @@ def render_purchase_recommendation(snapshot: RateSnapshot):
             "higher_is_better": True,
         },
         {
-            "yahoo_pair": "USD/CNY",
-            "display_pair": "CNY/USD",
-            "direction": "人民币换美元",
-            "inverse": True,   # 用 1/rate 作为历史数据
-            "higher_is_better": True,
-        },
-        {
             "yahoo_pair": "USD/HKD",
             "display_pair": "HKD/USD",
             "direction": "美元换港元",
